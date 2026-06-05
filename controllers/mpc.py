@@ -4,99 +4,134 @@ import numpy as np
 
 class Controller(BaseController):
   """
-  Offset-free linear MPC.
+  v0.2 -- offset-free linear MPC on a speed-scheduled ARX plant model.
 
-  Plant approximation (identified by probing tinyphysics):
-      a[k] = (1-beta)*a[k-1] + beta*G*u[k-1-delay]
-  i.e. lataccel is a delayed first-order response to steer, static gain G.
+  Plant model (identified by least-squares on dithered rollouts, piecewise in
+  speed -> coefficients interpolated by v_ego):
+      a[t] = a1 a[t-1] + a2 a[t-2] + b1 u[t-1] + b2 u[t-2] + b3 u[t-3]
+             + g roll[t] + c
+  DC gain rises ~1.2 (low v) -> 1.5 (high v); the model carries the real lag,
+  so we no longer need v0.1's detuned gain hack.
 
-  Each step we predict the lataccel trajectory over the future plan,
-      a = M @ u + decay*a0 + d_hat
-  and minimize the challenge's own quadratic cost plus a control-rate term:
-      w_track*||a-r||^2 + w_jerk*||Da||^2 + w_du*||Du||^2
-  in closed form (normal equations), applying only the first action
-  (receding horizon).
+  Each step we rebuild the impulse-response matrix M for the current speed,
+  predict a = M u + free_response(IC, future roll, c, bias) over the future
+  plan, and minimize  w_track||a-r||^2 + w_jerk||Da||^2 + w_du||Du||^2  in
+  closed form (receding horizon, apply first action).
 
-  d_hat is an estimated output disturbance updated from the one-step
-  prediction error -> integral action -> zero steady-state offset, which
-  absorbs gain mismatch and road-roll disturbance (this is what a plain
-  MPC lacks vs. a PID's integral term).
+  Bias is killed two ways:
+    * d_hat: offset-free output-disturbance estimate from the one-step
+      prediction error (integral action; near-zero now the model is accurate)
+    * i_term: a slow tracking-error integral backstop, anti-wound.
   """
 
-  def __init__(self, horizon=25, gain=4.4, beta=0.35, delay=0,
-               w_track=1.0, w_jerk=2.0, w_du=0.25, w_ctrl=1e-3, dist_gain=0.4):
-    # NOTE: `gain` is a tuning knob, deliberately set above the measured static
-    # gain (~1.9) and `delay` left at 0 -- both detune the closed loop for
-    # smoothness; the disturbance estimate (dist_gain) supplies the integral
-    # action that removes the resulting steady-state bias. Tuned on 20 segments.
+  # ARX coefficients [a1, a2, b1, b2, b3, g, c] at speed knots (m/s)
+  KNOT_V = np.array([11.0, 25.5, 33.0])
+  KNOT_COEF = np.array([
+    [0.486, 0.117, 0.060, 0.038, 0.385, 0.375,  0.033],
+    [0.537, 0.011, 0.007, 0.142, 0.484, 0.525, -0.009],
+    [0.598, 0.024, 0.314, 0.072, 0.181, 0.435,  0.002],
+  ])
+
+  def __init__(self, horizon=25, w_track=1.0, w_jerk=2.0, w_du=3.0,
+               w_ctrl=0.3, dist_gain=0.1, i_gain=0.05, i_clip=0.5):
     self.H = horizon
     self.w_track = w_track
     self.w_jerk = w_jerk
     self.w_du = w_du
     self.w_ctrl = w_ctrl
     self.dist_gain = dist_gain
+    self.i_gain = i_gain
+    self.i_clip = i_clip
 
-    H = horizon
-    # impulse response of the plant to a unit u at step 0, over a[1..H]
-    imp = np.zeros(H); a = 0.0
-    for k in range(H):
-      drive = 1.0 if (k - delay) >= 0 else 0.0
-      a = (1 - beta) * a + beta * gain * drive
-      imp[k] = a
-    M = np.zeros((H, H))
-    for j in range(H):
-      M[j:, j] = imp[:H - j]
-    self.M = M
-    self.decay = (1 - beta) ** np.arange(1, H + 1)   # free response of a0
-    self.Tout = np.eye(H) - np.eye(H, k=-1)          # output first-difference
-    self.Tin = np.eye(H) - np.eye(H, k=-1)           # input first-difference
+    self.Tout = np.eye(horizon) - np.eye(horizon, k=-1)
+    self.Tin = np.eye(horizon) - np.eye(horizon, k=-1)
 
-    # integral / disturbance estimate state
+    # state
+    self.a_m1 = None          # a[t-1]
+    self.u_hist = [0.0, 0.0, 0.0]   # [u[t-1], u[t-2], u[t-3]]
     self.d_hat = 0.0
-    self.prev_pred = None   # model's one-step-ahead prediction made last step
+    self.i_term = 0.0
+    self.prev_pred = None
     self.prev_u = 0.0
+
+  def _coef(self, v):
+    return np.array([np.interp(v, self.KNOT_V, self.KNOT_COEF[:, k]) for k in range(7)])
+
+  def _impulse(self, coef, H):
+    a1, a2, b1, b2, b3 = coef[:5]
+    h = np.zeros(H + 1)              # h[1..H]
+    if H >= 1: h[1] = b1
+    if H >= 2: h[2] = a1 * h[1] + b2
+    if H >= 3: h[3] = a1 * h[2] + a2 * h[1] + b3
+    for k in range(4, H + 1):
+      h[k] = a1 * h[k - 1] + a2 * h[k - 2]
+    return h[1:]
+
+  def _free_response(self, coef, H, a0, roll_future, bias):
+    a1, a2, b1, b2, b3, g, c = coef
+    um1, um2, um3 = self.u_hist
+    am1 = self.a_m1 if self.a_m1 is not None else a0
+    a_prev2, a_prev1 = am1, a0       # a[k-2], a[k-1]
+    out = np.zeros(H)
+    for k in range(1, H + 1):
+      # zero future input -> only past actions contribute, at k=1,2,3
+      ul1 = um1 if k == 1 else (um2 if k == 2 else (um3 if k == 3 else 0.0))
+      ul2 = um2 if k == 1 else (um3 if k == 2 else 0.0)
+      ul3 = um3 if k == 1 else 0.0
+      roll_k = roll_future[k - 1] if k - 1 < len(roll_future) else (roll_future[-1] if len(roll_future) else 0.0)
+      ak = a1 * a_prev1 + a2 * a_prev2 + b1 * ul1 + b2 * ul2 + b3 * ul3 + g * roll_k + c + bias
+      out[k - 1] = ak
+      a_prev2, a_prev1 = a_prev1, ak
+    return out
 
   def update(self, target_lataccel, current_lataccel, state, future_plan):
     a0 = current_lataccel
 
-    # --- offset-free update: correct disturbance from one-step prediction error ---
+    # --- integral updates (bias killers) ---
     if self.prev_pred is not None:
-      self.d_hat += self.dist_gain * (a0 - self.prev_pred)
+      self.d_hat += self.dist_gain * (a0 - self.prev_pred)        # offset-free
+    self.i_term += self.i_gain * (a0 - target_lataccel)           # tracking-error integral
+    self.i_term = float(np.clip(self.i_term, -self.i_clip, self.i_clip))
+    bias = self.d_hat + self.i_term
 
     future = future_plan.lataccel
     H = min(self.H, len(future))
+    coef = self._coef(state.v_ego)
+
     if H < 1:
-      u0 = (target_lataccel - self.d_hat) / max(self.M[0, 0], 1e-3)
-      u0 = float(np.clip(u0, -2, 2))
-      self.prev_u = u0
-      self.prev_pred = None
+      h1 = max(coef[2], 1e-3)
+      u0 = float(np.clip((target_lataccel - bias - coef[6]) / h1, -2, 2))
+      self._commit(a0, u0, None)
       return u0
 
-    M = self.M[:H, :H]
-    Tout = self.Tout[:H, :H]
-    Tin = self.Tin[:H, :H]
-    decay = self.decay[:H]
-    d_free = decay * a0 + self.d_hat            # free response + disturbance
+    roll_future = np.asarray(future_plan.roll_lataccel[:H], dtype=float)
+    h = self._impulse(coef, H)
+    M = np.zeros((H, H))
+    for off in range(H):                            # M[r,c]=h[r-c]: lower-tri Toeplitz
+      idx = np.arange(H - off)
+      M[idx + off, idx] = h[off]
+    d_free = self._free_response(coef, H, a0, roll_future, bias)
     r = np.asarray(future[:H], dtype=float)
 
-    # residuals (all linear in u)
-    bt = d_free - r                              # tracking:  M u + bt
-    TM = Tout @ M; bj = Tout @ d_free            # jerk:      TM u + bj  (a0 coupling below)
-    c = np.zeros(H); c[0] = a0; bj = bj - c
-    e0 = np.zeros(H); e0[0] = 1.0                # input-rate couples u0 to prev_u
+    Tout = self.Tout[:H, :H]; Tin = self.Tin[:H, :H]
+    bt = d_free - r
+    TM = Tout @ M
+    c0 = np.zeros(H); c0[0] = a0
+    bj = Tout @ d_free - c0
+    e0 = np.zeros(H); e0[0] = 1.0
 
-    Hqp = (self.w_track * (M.T @ M)
-           + self.w_jerk * (TM.T @ TM)
-           + self.w_du * (Tin.T @ Tin)
-           + self.w_ctrl * np.eye(H))
-    f = (self.w_track * (M.T @ bt)
-         + self.w_jerk * (TM.T @ bj)
+    Hqp = (self.w_track * (M.T @ M) + self.w_jerk * (TM.T @ TM)
+           + self.w_du * (Tin.T @ Tin) + self.w_ctrl * np.eye(H))
+    f = (self.w_track * (M.T @ bt) + self.w_jerk * (TM.T @ bj)
          - self.w_du * self.prev_u * (Tin.T @ e0))
 
     u = np.linalg.solve(Hqp, -f)
     u0 = float(np.clip(u[0], -2, 2))
-
-    # one-step-ahead prediction for next disturbance update
-    self.prev_pred = float(M[0] @ u + d_free[0])
-    self.prev_u = u0
+    self._commit(a0, u0, float(M[0] @ u + d_free[0]))
     return u0
+
+  def _commit(self, a0, u0, pred):
+    self.a_m1 = a0                  # becomes a[t-1] for the next call
+    self.prev_pred = pred
+    self.prev_u = u0
+    self.u_hist = [u0, self.u_hist[0], self.u_hist[1]]
