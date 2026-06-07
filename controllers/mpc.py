@@ -33,7 +33,7 @@ class Controller(BaseController):
   ])
 
   def __init__(self, horizon=25, w_track=1.0, w_jerk=2.0, w_du=3.0,
-               w_ctrl=0.3, dist_gain=0.1, i_gain=0.05, i_clip=0.5):
+               w_ctrl=0.5, dist_gain=0.1, i_gain=0.05, i_clip=0.5):
     self.H = horizon
     self.w_track = w_track
     self.w_jerk = w_jerk
