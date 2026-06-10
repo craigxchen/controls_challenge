@@ -2,6 +2,39 @@ from . import BaseController
 import numpy as np
 
 
+def _solve_spd(matrix, rhs):
+  """Small Cholesky solver avoiding slow generic LAPACK startup on tiny QPs."""
+  matrix = np.asarray(matrix, dtype=float)
+  rhs = np.asarray(rhs, dtype=float)
+  n = matrix.shape[0]
+  chol = np.zeros_like(matrix)
+
+  for i in range(n):
+    for j in range(i + 1):
+      acc = matrix[i, j]
+      if j:
+        acc -= float(chol[i, :j] @ chol[j, :j])
+      if i == j:
+        chol[i, j] = np.sqrt(max(acc, 1e-9))
+      else:
+        chol[i, j] = acc / chol[j, j]
+
+  y = np.zeros(n)
+  for i in range(n):
+    acc = rhs[i]
+    if i:
+      acc -= float(chol[i, :i] @ y[:i])
+    y[i] = acc / chol[i, i]
+
+  x = np.zeros(n)
+  for i in range(n - 1, -1, -1):
+    acc = y[i]
+    if i + 1 < n:
+      acc -= float(chol[i + 1:, i] @ x[i + 1:])
+    x[i] = acc / chol[i, i]
+  return x
+
+
 class Controller(BaseController):
   """
   v0.2 -- offset-free linear MPC on a speed-scheduled ARX plant model.
@@ -125,7 +158,7 @@ class Controller(BaseController):
     f = (self.w_track * (M.T @ bt) + self.w_jerk * (TM.T @ bj)
          - self.w_du * self.prev_u * (Tin.T @ e0))
 
-    u = np.linalg.solve(Hqp, -f)
+    u = _solve_spd(Hqp, -f)
     u0 = float(np.clip(u[0], -2, 2))
     self._commit(a0, u0, float(M[0] @ u + d_free[0]))
     return u0
